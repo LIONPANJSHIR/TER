@@ -1,0 +1,1319 @@
+---
+title: "H20 ML"
+format: html
+---
+
+## 
+
+```{r}
+#| include: false
+
+# # install.packages("h2o")
+# if ("package:h2o" %in% search()) { detach("package:h2o", unload=TRUE) }
+# if ("h2o" %in% rownames(installed.packages())) { remove.packages("h2o") }
+# 
+# pkgs <- c("RCurl","jsonlite")
+# for (pkg in pkgs) {
+#   if (! (pkg %in% rownames(installed.packages()))) { install.packages(pkg) }
+# }
+# 
+# install.packages("h2o", type="source", repos=(c("http://h2o-release.s3.amazonaws.com/h2o/latest_stable_R")))
+
+library(h2o)
+localH2O = h2o.init(max_mem_size = "16G")
+  # Pour allouer 32 Go de RAM
+
+```
+
+#### Packages
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+# install.packages("echarts4r")
+library(echarts4r)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(h2o4gpu)
+library(h2otools)
+library(cowplot)
+library(gridExtra)
+library(gt)
+library(patchwork)
+# Installer bbplot depuis GitHub
+# devtools::install_github("bbc/bbplot")
+library(bbplot)
+library(ggpubr)
+library(glitr)
+library(kableExtra)
+library(gt)
+library(plotly)
+library(tidyverse)
+colors <- palette.colors(4)
+```
+
+```{r}
+colors <- c("#000000" ,"#E69F00" ,"#56B4E9" ,"#009E73","#D02090","#CD5555")
+```
+
+```{r}
+#| message: false
+#| warning: false
+# Charger les données depuis un fichier CSV
+creditcard <- data.table::fread("creditcard.csv/creditcard.csv")
+
+# Sélection de certaines variables importantes pour l'analyse
+Vars <-  creditcard %>% dplyr::select(V17, V10, V11, V7, V3, V16, V12, V14, Class, Time, V5, V25)
+
+# Conversion des données en format H2O pour le calcul parallèle
+data <- as.h2o(Vars)
+
+
+# Division en 3 ensembles : entraînement (60%), test (30%), calibration (10%)
+split_calib <- h2o.splitFrame(data, ratios = c(0.6, 0.3), seed = 123)
+train <- split_calib[[1]]
+test  <- split_calib[[2]]
+calib <- split_calib[[3]]
+
+# Conversion de la variable cible en facteur pour un traitement en classification
+train$Class <- as.factor(train$Class)
+test$Class <- as.factor(test$Class)
+
+
+# Définition des variables explicatives (x) et de la variable cible (y)
+x <- setdiff(names(train), "Class")
+y <- "Class"
+
+
+
+```
+
+```{r}
+#| include: false
+ # Chargement de la librairie ROSE pour le rééquilibrage des classes
+library(ROSE)
+
+# Fixer la graine aléatoire pour assurer la reproductibilité des résultats
+set.seed(123)
+
+# Conversion des données d'entraînement en un data frame classique (nécessaire pour ROSE)
+Train <- as.data.frame(train)
+
+# Sur-échantillonnage : Augmentation des occurrences de la classe minoritaire
+Train_over <- ovun.sample(Class ~ ., Train, method = "over")$data |> 
+  as.h2o() 
+
+# Sous-échantillonnage : Réduction des occurrences de la classe majoritaire (p = proportion de la classe minoritaire à conserver)
+Train_under <- ovun.sample(Class ~ ., Train, method = "under", p = 0.3)$data |> 
+  as.h2o()
+
+# Échantillonnage mixte : Combinaison de sur- et sous-échantillonnage pour équilibrer les classes
+Train_both <- ovun.sample(Class ~ ., Train, method = "both", p = 0.3)$data |> 
+  as.h2o()
+
+```
+
+```{r}
+# Conversion de la variable cible en facteur pour les ensembles sur-échantillonnés et équilibrés
+Train_over$Class <- as.factor(Train_over$Class)
+Train_both$Class <- as.factor(Train_both$Class)
+```
+
+#### Fonctions
+
+```{r}
+# Désactive l'affichage des messages et avertissements pour rendre la sortie plus propre
+#| message: false
+#| warning: false
+
+# ------------------------------------------------------------------------#
+# Fonction pour tracer la courbe Precision-Recall                         #
+# ------------------------------------------------------------------------#
+draw_pr <- function(perf, sub, cap, x=0.5, y=moyenne+0.05){
+  
+  # Extraction des valeurs de rappel (Recall) et de précision (Precision)
+  pr_data <- data.frame(
+    Recall = h2o.recall(perf)[,2],
+    Precision = h2o.precision(perf)[,2]
+  )
+  
+  # Calcul de la moyenne de la précision et du rappel
+  moyenne <- mean(pr_data$Precision)
+  moy_rec <- mean(pr_data$Recall)
+  
+  # Création de la courbe Precision-Recall
+  p <- pr_data %>% ggplot(aes(x=Recall, y=Precision)) +
+    geom_line() +  # Tracé de la courbe
+    geom_hline(yintercept = moyenne, color="red", linetype="dashed") +  # Ligne de la moyenne
+    annotate("text", x=x, y=y, label="Moyenne de la précision", color="gray30") +
+    ggthemes::theme_fivethirtyeight(base_family = "serif") +
+    labs(title="Courbe Precision-Recall",
+         subtitle = sub,
+         caption = cap) +
+    geom_ribbon(aes(ymin=0, ymax=Precision), fill="#E69F00", alpha=0.2) +  # Zone sous la courbe
+    theme(plot.title.position = "plot",
+          plot.caption.position = "plot",
+          text=element_text(colour="grey30"))
+  
+  print(p)
+}
+
+# ------------------------------------------------------------------------#
+# Fonction pour tracer la courbe Lift et Gain                             #
+# ------------------------------------------------------------------------#
+Lift <- function(model){
+  
+  # Extraction des valeurs de gain et lift cumulés
+  lift <- h2o.gains_lift(model) |> 
+    select(lift, cumulative_lift, cumulative_gain, cumulative_data_fraction, cumulative_capture_rate)
+
+  # Courbe des gains cumulés
+  A <- lift |> 
+    ggplot(aes(x=cumulative_data_fraction)) +
+    geom_line(aes(y=cumulative_capture_rate), color="#178840", linewidth=1) +
+    geom_line(aes(y=cumulative_lift), color=colors[1], linewidth=1) +
+    theme(panel.grid = element_blank()) +
+    si_style_transparent() +
+    labs(y="Cumulative capture rate, Cumulative lift",
+         x="Fractions des données cumulées",
+         title = "Courbe des gains cumulée") + 
+    theme(plot.title.position = "plot",
+          plot.title = element_text(family="serif", face = "bold.italic"))
+
+  # Courbe Lift
+  B <- lift |> 
+    ggplot(aes(x=cumulative_data_fraction)) +
+    geom_line(aes(y=lift), color=colors[2], linewidth=1) +
+    theme(panel.grid = element_blank()) +
+    si_style_transparent() +
+    labs(y="Lift",
+         x="Fractions des données cumulées",
+         title = "Courbe Lift") + 
+    theme(plot.title.position = "plot",
+          plot.title = element_text(family="serif", face = "bold.italic"))
+
+  # Affichage des deux graphiques côte à côte
+  cowplot::plot_grid(A, B)
+}
+
+# ------------------------------------------------------------------------#
+# Matrice de confusion avec mise en forme GT                              #
+# ------------------------------------------------------------------------#
+matrice_conf <- function(performance, Nom_modele, Source){
+  matrice <- h2o.confusionMatrix(performance)
+  names(matrice) <- c("Légitime", "Fraude", "Erreur", "Pourcentage")
+  
+  # Création de la table avec GT
+  cbind(" " = c(rep("Prédit=", 2), " "),
+        "Observé=" = c("Légitime", "Fraude", "Total"), matrice) %>%
+    gt() %>% tab_header(
+      title = paste("Matrice de confusion du modèle", Nom_modele),
+      subtitle = md("0: Pas fraude, 1: Fraude")
+    ) %>% opt_align_table_header(
+      align = "left"
+    ) %>% fmt_number(columns = Erreur, decimals = 4) %>% cols_width(
+      Légitime ~ px(120),
+      Fraude ~ px(60),
+      Erreur ~ px(120)
+    ) %>% tab_source_note(
+      source_note = md(Source)
+    ) %>% tab_footnote(
+      footnote = "Faux positif",
+      locations = cells_body(columns = Légitime, rows = 2)
+    ) %>% tab_footnote(
+      footnote = "Faux négatif",
+      locations = cells_body(columns = Fraude, rows = 1)
+    )
+}
+
+# ------------------------------------------------------------------------#
+# Tracé de la courbe ROC                                                  #
+# ------------------------------------------------------------------------#
+Roc <- function(performance){
+  
+  # Extraction des valeurs de sensibilité et de spécificité
+  roc_data <- data.frame(
+    Sensitivite = h2o.tpr(performance)$tpr,
+    Specificite = h2o.fpr(performance)$fpr
+  )
+  
+  # Tracé de la courbe ROC
+  ggplot(roc_data, aes(x = Specificite, y = Sensitivite)) +
+    geom_line(color="black", linewidth=1) +
+    labs(x = "1-Specificité", y = "Sensitivité", title = "Courbe ROC") +
+    geom_abline(intercept = 0, color="skyblue", linewidth=0.7) +
+    si_style()
+}
+
+# ------------------------------------------------------------------------#
+# Analyse de l'importance des variables par permutation                   #
+# ------------------------------------------------------------------------#
+Importance_plot <- function(model, test, metric="PR_AUC", n_repats=10){
+  
+  # Calcul de l'importance des variables par permutation
+  Importance_permutation <- h2o.permutation_importance(model, test, seed=123, metric = metric)
+  A <- h2o.permutation_importance(model, test, seed=123, metric = metric, n_repeats = n_repats)
+  
+  # Graphique de l'importance normalisée
+  D <- Importance_permutation |> ggplot(aes(x=reorder(Variable, -`Scaled Importance`), y=`Scaled Importance`, fill=`Scaled Importance`)) +
+    geom_col() +
+    scale_fill_viridis_b(option  = "A") +
+    labs(x="Variable", y="Valeurs Normalisées", fill="Valeurs Normalisées")
+
+  # Graphique de l'importance en pourcentage
+  B <- Importance_permutation |> ggplot(aes(x=reorder(Variable, -Percentage), y=Percentage, fill=Percentage)) +
+    geom_col() +
+    scale_fill_viridis_b(option = "A") +
+    labs(x="Variables", y="Pourcentage", title = "Contributions des variables en %")
+
+  # Transformation des données pour ggplot
+  df_long <- A |> pivot_longer(cols = starts_with("Run"), names_to = "Run", values_to = "Importance")
+
+  # Graphique de la distribution des importances par variable
+  C <- ggplot(df_long, aes(x = reorder(Variable, Importance), y = Importance, fill=Variable)) +
+    geom_boxplot() +
+    scale_fill_viridis_d(option = "plasma") +
+    theme_minimal() +
+    labs(title = "Distribution des Importances par Variable",
+         x = "",
+         y = "Importance") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_flip() +
+    si_style(text_scale = 0.8) +
+    theme(legend.position = "right",
+          axis.text.y = element_blank(),
+          plot.title.position = "plot",
+          axis.title.x = element_text(size = 10.5, face = "bold.italic"))
+
+  C + (D / B) +
+    plot_layout(widths = c(3,2)) +
+    plot_annotation(
+      title = "Importances Variables",
+      tag_levels = c("A"),
+      tag_prefix = "Figure",
+      tag_suffix = ":"
+    )
+}
+
+
+
+
+
+
+
+
+#---------------------------------------------------------------------------#
+# Performance data
+# --------------------------------------------------------------------------#
+
+
+
+performance_all_model <- function(model, threshold, Nom) {
+  performance <- h2o.performance(model ,test)
+  sensitivity = h2o.sensitivity(performance, thresholds = threshold)
+  specificity = h2o.specificity(performance, thresholds = threshold)
+  F1 = h2o.F1(performance, thresholds = threshold)
+  AUC = h2o.auc(performance)
+  AUC_pr = h2o.aucpr(performance)
+  TPR = h2o.tpr(performance, thresholds = threshold)
+  TNR = h2o.tnr(performance,thresholds = threshold)
+  Recall = h2o.recall(performance, thresholds = threshold)
+  mcc = h2o.mcc(performance,thresholds = threshold)
+  mean_per_class_error = h2o.mean_per_class_error(performance)
+  erreur = h2o.error(performance,thresholds = threshold)
+  missrate = h2o.missrate(performance , thresholds = threshold)
+  
+  
+  # Create a data frame to store the performance metrics
+  data <- data.frame(
+    row.names = Nom,
+    sensitivity = sensitivity,
+    AUC = AUC,
+    AUC_pr = AUC_pr,
+    TPR = TPR,
+    TNR = TNR,
+    Recall = Recall,
+    mcc = mcc,
+    mean_per_class_error = mean_per_class_error,
+    F1 = F1 ,
+    Erreur = erreur ,
+    Missrate = missrate )
+  # )[1,]
+  
+  colnames(data) <- c(" sensitivity ",
+    "AUC" ,
+   " AUC_pr",
+    "TPR",
+   " TNR ",
+  " Recall ",
+    "mcc",
+   " mean_per_class_error ",
+    "F1" ,
+    "Erreur",
+    "Missrate"
+  # )[1,]"
+    
+  )
+  
+  return(data )
+}
+
+
+
+
+#---------------------------------------------------------------------------#
+# Vue d'ensemble 
+# --------------------------------------------------------------------------#
+
+View_perf <- function(model,test){
+  performance <- h2o.performance(model,test)
+  performance@metrics$thresholds_and_metric_scores |> select(threshold,absolute_mcc,tpr,tnr,fpr,fnr,f1,f2,precision,f0point5) |>  View()
+}
+
+# Example usage
+```
+
+#### Auto-ML
+
+```{r}
+auto_both <- h2o.automl(
+  x=x,
+  y=y,
+  training_frame = Train_over,
+  validation_frame = test,
+  nfolds = 5,
+  seed = 123,
+  max_models = 50,
+  project_name = "TER",
+  keep_cross_validation_predictions = TRUE,
+  keep_cross_validation_models = TRUE,
+  keep_cross_validation_fold_assignment = TRUE,
+  exclude_algos = c("DeepLearning"),
+sort_metric = "AUCPR",
+max_runtime_secs = 3600 
+  
+)
+```
+
+```{r}
+# répertoire 
+path_save <- "C:/TER2/TER/auto_ml_over_complet"
+
+# on recupere les id_des_models
+model_ids <- as.vector(auto_both@leaderboard$model_id)
+
+# Sauvegarder chaque modèle
+for (i in seq_along(model_ids)) {
+  model <- h2o.getModel(model_ids[i])  # Récupérer le modèle
+  h2o.saveModel(object = model, path = path_save, force = TRUE)
+}
+
+```
+
+```{r}
+model_ids <- as.data.frame(auto_both@leaderboard$model_id)
+# GBM_model <- h2o.getModel()
+# GBM_model_id <- model_ids |>filter(grepl("^GBM",model_id))
+best_gbm_model <- h2o.get_best_model(auto_both,"gbm",criterion="AUCPR")
+best_glm_model <- h2o.get_best_model(auto_both,"glm",criterion="AUCPR")
+best_drf_model <- h2o.get_best_model(auto_both,"drf",criterion ="AUCPR")
+best_xrt_model <- h2o.getModel("XRT_1_AutoML_1_20250310_02332")
+# best_xrt_model <- h2o.get_best_model(auto_both,"",criterion ="AUCPR")
+best_automl_model <- auto_both@leader
+# best_stacked_model <- h2o.get_best_model(auto_both,"stackedensemble",criterion ="AUCPR")
+
+h2o.saveModel(best_gbm_model,"C:/TER2/TER/auto_ml_over_complet/best")
+h2o.saveModel(best_glm_model,"C:/TER2/TER/auto_ml_over_complet/best")
+h2o.saveModel(best_drf_model,"C:/TER2/TER/auto_ml_over_complet/best")
+# h2o.saveModel(h2o.getModel("DRF_1_AutoML_1_20250310_02332"),path = "C:/TER2/TER/auto_ml_both_model/best")
+
+# Best model ID DRF_1_AutoML_1_20250310_02332 
+
+```
+
+```{r}
+best_automl_model <- h2o.loadModel("C:/TER2/TER/auto_ml_both_model/best/DRF_1_AutoML_1_20250310_02332 ")
+
+best_glm_model <- h2o.loadModel("C:/TER2/TER/auto_ml_both_model/best/GLM_1_AutoML_1_20250310_02332 ")
+
+best_gbm_model <- h2o.loadModel("C:/TER2/TER/auto_ml_both_model/best/GBM_grid_1_AutoML_1_20250310_02332_model_8 ")
+
+best_xrt_model <- h2o.loadModel("C:/TER2/TER/auto_ml_both_model/XRT_1_AutoML_1_20250310_02332")
+```
+
+```{r}
+#Performance des modèles 
+best_gbm_perf_automl <- h2o.performance(best_gbm_model,test)
+best_glm_perf_automl <- h2o.performance(best_glm_model,test)
+best_xrt_perf_automl <- h2o.performance(best_xrt_model,test)
+leader_perf_automl <- h2o.performance(best_automl_model,test)
+
+# predictions 
+best_glm_pred_automl <- h2o.predict(best_glm_model, test)
+best_gbm_pred_automl <- h2o.predict(best_gbm_model, test)
+best_xrt_pred_automl <- h2o.predict(best_xrt_model, test)
+leader_pred_automl <- h2o.predict(best_automl_model, test)
+
+```
+
+### Best model
+
+```{r}
+# h2o.shutdown()
+h2o.init()
+# h2o.init(nthreads = 6, max_mem_size = "10G", port = 54321)
+# h2o.init(nthreads = 6, max_mem_size = "4G", port = 54322)
+
+```
+
+```{r}
+best_none1 <- h2o.getModel("GBM_grid_1_AutoML_14_20250314_195334_model_40") # fixette 
+
+best_over3 <- h2o.getModel("GBM_grid_1_AutoML_13_20250314_180418_model_2") #fixette
+best_both2 <- h2o.getModel("GBM_grid_1_AutoML_12_20250314_172420_model_5") #fixette
+best_both3 <- h2o.getModel("GBM_grid_1_AutoML_12_20250314_172420_model_90") # fixete
+```
+
+Intéressons nous a la courbe d'apprentissage du meilleur modèle proposé par automl
+
+```{r}
+
+
+
+A <- h2o.learning_curve_plot(best_automl_model,"aucpr")+
+  labs(x="Nombres d'arbres",
+       y="PRAUC",
+       title= "Courbe d'apprentissage",
+       subtitle = "Model:RF "
+       )
+
+B <- h2o.learning_curve_plot(best_automl_model,"auc")+
+  labs(x="Nombres d'arbres",
+       # y=,
+       title= "",
+       subtitle = " "
+       )
+
+# C <- h2o.learning_curve_plot(best_automl_model,"logloss")+
+#   labs(x="Nombres d'arbres",
+#        # y=,
+#        title= "",
+#        subtitle = " "
+#        )
+# plot_grid(A,B,nrow = 2)
+grid.arrange(A,B,nrow=2)
+
+
+
+
+
+```
+
+La courbe d'apprentissage indique de très bonnes performances tant sur l'entraînement que sur la validation. Sur la courbe d'entraînement, la performance atteint un maximum proche de 1, ce qui montre que le modèle a bien assimilé la structure des données d'entraînement. Quant à la courbe de validation, l'AUC varie entre 0,92 et 0,94, ce qui représente une performance exceptionnelle.
+
+***Cependant***, sur le premier graphique, on observe un léger manque d'assimilation sur les données de validation, avec un léger surapprentissage (**overfitting**). La performance sur la validation reste élevée (\~0.82), ce qui suggère que l'overfitting n'est pas problématique, mais mérite d'être pris en compte
+
+```{r}
+matrice_conf(leader_perf_automl,": Distributed Random Forest","***Distributed Random Forest** est un algorithme d'apprentissage automatique basé sur la méthode des forêts aléatoires (Random Forest)*.\n\n **C'est le meilleur modèle parmit celle généré par AutoML.h2o**")
+```
+
+### Courbe Précision-Rappel
+
+Lorsque les classes sont déséquilibrées, la courbe ROC peut donner une vision trop optimiste des performances du modèle, voire exagérer ses capacités. Dans ces situations, une alternative plus adaptée est la **courbe précision-rappel**.
+
+```{r}
+
+Roc(leader_perf_automl)
+
+```
+
+En classification, il est souvent nécessaire de trouver un **compromis** entre :
+
+-   **Le rappel (recall)** : la capacité à identifier toutes les instances positives (fraudes)
+
+-   **La précision (precision)** : la proportion de détections correctes parmi les prédictions positives.
+
+Augmenter l’un de ces critères entraîne généralement une baisse de l’autre. Par exemple, **augmenter le rappel** permet de détecter plus de fraudes, mais peut aussi générer plus de **faux positifs**, réduisant ainsi la précision. À l’inverse, **améliorer la précision** peut diminuer le nombre de faux positifs, mais risque de laisser passer certaines fraudes (baisse du rappel).
+
+Dans un problème de classification déséquilibré, la courbe précision-rappel est donc un outil essentiel pour évaluer **l'efficacité réelle du modèle**, en mettant en avant la balance entre **détection des fraudes et erreurs de classification**.
+
+```{r,fig.show='asis',fig.align='right'}
+draw_pr(leader_perf_automl,"Leader AutoML","Echantillonage :Over + under Sampling")+
+  geom_vline(xintercept = 0.8,linetype="dashed",col="#56B4E9",linewidth=0.9)+
+  annotate("text",x=0.88,y=0.90,label="Meilleurs compromis")
+```
+
+Le model montre des performances assez satisfaisante jusqu’à un rappel d’environ 80 % et d'une précision autour des 82% . Cela entraîne que le modèle identifie **assez bien** la majorité des transactions frauduleuses tout en limitant le nombre de fausses alertes (Faux positive et Faux négative )
+
+#### Importances des variables
+
+Dans ce modele de Random Forest ,les variables V14 ,V12 et V17 sont les varaibles les plus importances comme le montre la figure D , la variables V14 et V12 contribue a deux environs 65% de l'explicabilite des predictions (figure C)
+
+```{r,fig.width=12}
+
+Importance_plot(best_automl_model,test)
+```
+
+Les variables V14 et V12 contribuent-elles positivement ou négativement à la prédiction des transactions frauduleuses ?
+
+Le graphique présenté ne fournit pas suffisamment d’informations pour interpréter précisément le sens de la contribution de ces variables à la prédiction de la fraude. Pour pallier cette limitation, nous introduisons d’autres approches permettant d’expliquer le modèle à la fois de manière locale et globale.
+
+Progressivement, nous intégrerons des méthodes d’interprétabilité avancées telles que les valeurs de Shapley, LIME, PDP, afin d’obtenir une meilleure compréhension de l’impact des variables sur les prédictions du modèle.
+
+#### Courbe Lift & Diagramme des gains cumulé
+
+La courbe lift permet de comparer un modèle pré-entraîné par rapport a un model de référence (**baseline** )
+
+Ont utilises ces derniers pour évaluer les performances de notre modèle de classification. La courbe des gains indique le taux de vrais positifs en pourcentage par rapport au pourcentage de dénombrements totaux. La courbe de lift représente le lift cumulé (ou non cumulé) par rapport au pourcentage de dénombrements totaux.
+
+source : [Assitance de Minitab](https://support.minitab.com/fr-fr/minitab/help-and-how-to/statistical-modeling/predictive-analytics/how-to/random-forests-classification/interpret-the-results/gain-chart-and-lift-chart/)
+
+```{r fig.width=12}
+#| warning: false
+# Lift(best_automl_model)
+
+# Convertir les données en dataframe classique
+gains_df <- as.data.frame(h2o.gainsLift(best_automl_model,test))
+# options(repr.plot.width = 12, repr.plot.height = 8)  # Augmente la taille du plot
+# h2o.gains_lift(best_automl_model,test)
+
+# Tracer le diagramme de gain cumulé
+A <- ggplot(gains_df, aes(x = cumulative_data_fraction, y = cumulative_capture_rate)) +
+  geom_line(color = "#E69F00", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "#000000",linewidth=0.8) +  # Baseline aléatoire
+  labs(title = "Diagramme de Gain Cumulé",
+       x = "Proportion des transactions analysées",
+       y = "Proportion des fraudes détectées") +
+  theme_minimal()
+
+
+B <- ggplot(gains_df, aes(x = cumulative_data_fraction , y = cumulative_lift)) +
+  geom_line(color = "#E69F00", size = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#000000",linewidth=0.8) +  # Baseline aléatoire
+  theme_minimal()+
+  labs(title = "Courbe de Lift",
+       x = "Proportion des transactions analysées",
+       y = "Lift")
+
+
+(A+B)+patchwork::plot_annotation(
+                        title = "Courbe de surperformance lift",
+                        caption  = "Modèle :Best_auto_ml",
+                        tag_prefix = "Graphe : ",
+                        tag_levels = "A",
+                        tag_suffix = ";",
+                        theme = bbc_style())
+
+
+
+```
+
+On note que :
+
+-   Le modèle montre une bonne performance de détection, puisqu’il peut identifier environ 95 % des fraudes en analysant seulement 65 % des transactions (selon le graphique de gain cumulé).
+-   Le « ***Lift*** » très élevé au début (près de 30) indique que le modèle est environ 30 fois plus efficace qu’une sélection aléatoire pour détecter les fraudes dans les premiers pourcentages de transactions analysées.
+
+#### 
+
+#### Erreur de prediction
+
+```{r}
+pred_leader <-h2o.predict(best_automl_model, newdata = test)
+
+Test <- test |>  as.data.frame()
+
+Test <- cbind(Test,Prediction_leader = ifelse(pred_leader$p1 > 0.45,1,0) |> as.factor() |> as.data.frame())
+
+Test <- Test |> mutate(Consta = case_when(
+  C1 == 1 & Class == 1 ~ "TP",
+  C1 == 0 & Class == 0 ~ "TN",
+  C1 == 0 & Class == 1 ~ "FN",
+  C1 == 1 & Class == 0 ~ "FP"
+),Consta=as.factor(Consta))
+
+
+Test |> ##filter(Consta %in% c("FN","FP")) |> ## 
+  ggplot(aes(x=V14,y=V12,color=Consta))+
+  geom_point()+labs(title="Distributions de la valeur V12 en fonction de V14 (25% des données)",
+                    subtitle="En couleur les distributions des erreurs")
+
+
+
+```
+
+```{r}
+# library(umap)
+# Variables <- Test |> select( V17,V10,V11,V7,V3,V16,V12, V14,Time,V5,V25) |> sample_n(50000,replace = FALSE)
+# umap_model <- umap(Variables)
+
+
+
+
+# Ajouter les nouvelles dimensions au DataFrame
+set.seed(123)
+Test_umap <- Test |> sample_n(50000,replace = FALSE)
+
+Test_umap$UMAP1<- umap_model$layout[,1]
+Test_umap$UMAP2 <- umap_model$layout[,2]
+
+# write.csv(Test_umap,"Test_umap.csv")
+
+library(ggplot2)
+
+ggplot(Test_umap, aes(x = UMAP1, y = UMAP2, color = Consta))+ 
+                       # size = ifelse(Consta %in% c("FP", "FN"), 2, 0.9)))+  
+  geom_point(alpha = 0.7) +  
+  scale_color_manual(values = c("FP" = "#F4A261",  # Orange vif
+                                "FN" = "#E63946",  # Rouge foncé
+                                "TP" = "#2A9D8F",  # Vert
+                                "TN" = "#BFBFBF")) +  # Gris clair
+  labs(title = "Visualisation des erreurs avec UMAP") +
+  theme_minimal() +
+  guides(size = "none", shape = "none")  # Supprime les légendes inutiles
+
+```
+
+\
+
+```{r}
+# library(Rtsne)
+# library(dbscan)
+# library(ggplot2)
+# library(future.apply)
+# 
+# # 🔹 Activer le calcul parallèle
+# plan(multisession, workers = parallel::detectCores() - 1)
+# 
+# # 🔹 Réduction de dimension avec t-SNE (parallélisé)
+# set.seed(42)
+# tsne_res <- future_lapply(1, function(x) {
+#   Rtsne(Test_umap[, c("UMAP1", "UMAP2")], perplexity = 50, theta = 0.5, dims = 2, check_duplicates = FALSE)
+# }, future.seed=TRUE)[[1]]
+# 
+# # Ajouter les résultats au dataframe
+# Test_umap$TSNE1 <- tsne_res$Y[, 1]
+# Test_umap$TSNE2 <- tsne_res$Y[, 2]
+# 
+# # 🔹 Sélectionner uniquement les erreurs FP/FN
+# errors_only <- Test_umap[Test_umap$Consta %in% c("FP", "FN"), c("TSNE1", "TSNE2")]
+# 
+# # 🔹 Clustering DBSCAN (parallélisé)
+# set.seed(42)
+# clustering <- future_lapply(1, function(x) {
+#   dbscan(errors_only, eps = 0.8, minPts = 10)  # Ajuste eps et minPts en fonction de la densité des erreurs
+# }, future.seed=TRUE)[[1]]
+# 
+# # Ajouter les labels des clusters
+# Test_umap$Cluster <- "None"
+# Test_umap$Cluster[Test_umap$Consta %in% c("FP", "FN")] <- as.factor(clustering$cluster)
+# 
+# # 🔹 Visualisation
+# ggplot(Test_umap, aes(x = UMAP1, y = UMAP2, color = Cluster)) +
+#   geom_point(alpha = 0.9, size = 1.2) +
+#   scale_color_manual(values = c("None" = "grey80", "0" = "black", "1" = "red", "2" = "blue", "3" = "green")) +  
+#   labs(title = "Clustering des erreurs avec t-SNE + DBSCAN") +
+#   theme_minimal()
+# 
+
+```
+
+```{r}
+library(future.apply)
+
+plan(multisession)  # Active le calcul parallèle
+resultats <- future_lapply(1:10, function(x) {
+  runif(1)  # Génère un nombre aléatoire
+}, future.seed=TRUE)  # 🔥 Fixe la graine de manière sûre
+
+
+library(future.apply)
+library(Rtsne)
+
+plan(multisession)  # Active plusieurs cœurs
+
+tsne_res <- future_lapply(1, function(x) {
+  Rtsne(errors_only, perplexity = 30, theta = 0.5, dims = 2, check_duplicates = FALSE)
+}, future.seed=TRUE)  # 🔥 Assure un tirage aléatoire correct
+
+```
+
+#### shapley
+
+```{r}
+h2o.shap_summary_plot(best_automl_model,test,top_n_features=10,sample_size =4000 ) |> ggplotly()
+
+
+# 
+# pred_contrib_leader <- h2o.predict_contributions(best_automl_model,
+#                                               test,
+#                                               top_n = 10,
+#                                               compare_abs = TRUE)
+# # 
+# 
+# ID <- pred_contrib_leader |>  h2o.getId() 
+# 
+# h2o.save_frame(pred_contrib_leader,"C:/TER2/TER/auto_ml_both_model")
+
+pred_contrib_leader <- h2o.load_frame("contributions__8884_DRF_1_AutoML_1_20250310_02332_on_RTMP_sid_87e9_11","C:/TER2/TER/auto_ml_both_model")
+```
+
+```{r}
+# pred_contrib_leader <- h2o.predict_contributions(best_gbm_model,calib)
+
+# Conversion en format long pour ggplot2
+shap_long <- pred_contrib_leader %>% as.data.frame() |> 
+  pivot_longer(cols = -BiasTerm, names_to = "Variables", values_to = "Valeur_shap")
+
+
+shap_stats <- shap_long %>%
+  group_by(Variables) %>%
+  summarise(Mean_SHAP = mean(abs(Valeur_shap)), Variance_SHAP = var(Valeur_shap))
+
+
+# Aperçu des données transformées
+# head(shap_long)
+
+B <- ggplot(shap_long, aes(x = reorder(Variables, abs(Valeur_shap), FUN = median), y = Valeur_shap, fill = Variables)) +
+  geom_boxplot(alpha = 0.7) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Distribution des valeurs SHAP par variable", x = "Feature", y = "Valeur SHAP") +
+  theme(legend.position = "none")
+
+
+
+A <- ggplot(shap_stats, aes(x = Mean_SHAP, y = Variance_SHAP, label = Variables)) +
+  geom_point(color = "blue") +
+  geom_text(vjust = 1.5) +
+  theme_minimal() +
+  labs(title = "Relation entre Moyenne et Variance des Valeurs SHAP",
+       x = "Moyenne des valeurs SHAP (Importance globale)",
+       y = "Variance des valeurs SHAP (Stabilité de l'impact)")
+
+
+B+A
+
+```
+
+```{r}
+performance_models <- performance_all_model(leader_perf_automl, threshold = 0.4500000, Nom = "leader")
+
+performance_models
+
+```
+
+```{r}
+```
+
+### Gradient Boosting Model AutoML
+
+```{r}
+
+
+A <- h2o.learning_curve_plot(best_gbm_model,"aucpr")+
+  labs(x="Nombres d'arbres",
+       y="PRAUC",
+       title= "Courbe d'apprentissage",
+       subtitle = "Model:Gradient Boosting "
+       )
+
+B <- h2o.learning_curve_plot(best_gbm_model,"auc")+
+  labs(x="Nombres d'arbres",
+       # y=,
+       title= "",
+       subtitle = " "
+       )
+
+# plot_grid(A,B,nrow = 2)
+grid.arrange(A,B,nrow=2)
+```
+
+```{r}
+matrice_conf(best_gbm_perf_automl,"Gradient Boosting","C'est le meilleur modèle GBM parmit celle généré par AutoML.h2o")
+```
+
+#### Courbe Lift
+
+-   **Si le Lift du 1er décile est très haut (ex : 30x ou plus)**, le modèle est **très efficace pour classer les fraudes en haut**.
+-   **Si le Lift est faible (proche de 1 partout)**, alors **le modèle ne fait pas mieux qu’un tri aléatoire**.
+-   **Si le Response Rate dans les premiers déciles est élevé**, le modèle détecte bien les fraudes en priorité.
+
+```{r}
+Lift(best_gbm_model)
+h2o.gainsLift(best_gbm_perf_automl) |> select(cumulative_data_fraction,lift,response_rate)
+
+
+
+```
+
+-   Gains/Lift Table: Avg response rate: 0.17 %, avg score: 0.16 % (***sur l’échantillon du test set*** ) les deux sont a peut près équivalent a 1% près ce qui est une bonne nouvelles cela suggère que votre modèle prédictif est bien calibré - il prédit des probabilités qui correspondent assez bien aux taux de réponse réels observés.
+
+-   Cependant la courbe lift donne des bons résultat sur 40% des fractions des donnés cumulé puis chute drastiquement vers 0
+
+```{r}
+
+draw_pr(best_gbm_perf_automl,"Model:GBM","AutoMl")
+```
+
+```{r}
+Roc(best_gbm_perf_automl)
+
+```
+
+#### Variables importantes du modèle
+
+**L'importance de la variable de permutation** est obtenue en mesurant [la distance entre les erreurs de prédiction avant et après la permutation]{.underline} d’une caractéristique ; Une seule fonction à la fois est permutée.
+
+```{r}
+
+```
+
+I.  Interprétation du modèle
+
+```{r}
+# shap <- 
+h2o.shap_summary_plot(best_gbm_model,test,sample_size=5000) |> ggplotly()
+# gbm_pred_contrib <- h2o.predict_contributions(best_gbm_model,
+#                                               test,
+#                                               top_n = 10,
+#                                               compare_abs = TRUE)
+# 
+# h2o.save_frame(gbm_pred_contrib,"gbm_pred_contrib",force=TRUE)
+# h2o.getId(gbm_pred_contrib)
+gbm_pred_contrib <- h2o.load_frame("contributions__b166_GBM_grid_1_AutoML_1_20250310_02332_model_8_on_RTMP_sid_87e9_11","C:/TER2/TER/auto_ml_both_model")
+```
+
+#### Modele GLM
+
+#### **Amplitudes des coefficients normalisés**
+
+Ce graphique représente la relation entre une caractéristique spécifique et la variable de réponse. Les coefficients peuvent être positifs (orange) ou négatifs (bleu). Un coefficient positif indique une relation positive entre la caractéristique et la réponse, où une augmentation de la caractéristique correspond à une augmentation de la réponse, tandis qu’un coefficient négatif représente une relation négative entre la caractéristique et la réponse où une augmentation de la caractéristique correspond à une diminution de la réponse (ou vice versa).
+
+```{r}
+h2o.std_coef_plot(best_glm_model)
+```
+
+-   Les variables **V14 et V1**2 exercent ***l’influence négative la plus forte sur la prédiction*** avec des coefficients maximaux. Plus ces variables augmente plus le modèle a tendance a `prédire une transaction légitime et inversement elle prédit une transaction frauduleuses`
+
+-   Les variables **V5,V11 et V7 r**eprésente les variable ayant une `l’influence positive` avec un coefficient positive.
+
+-   Plus la valeur est grande plus la transactions est susceptible d'être une fraude
+
+-   La majorité des variables (**V14, V12, V16, V3, V10, V17, Time, V25**) ont un impact négatif sur le résultat, tandis que seulement trois variables (**V5, V11, V7**) contribuent positivement.
+
+```{r}
+
+
+
+lb <- auto@leaderboard
+auto@leader
+auto@leaderboardm
+
+model_ids <- as.data.frame(lb$model_id)
+
+se <- h2o.getModel(grep("StackedEnsemble_AllModels",model_ids,value = TRUE)[1])
+
+
+
+
+# h2o.saveModel(se,"model_h2o_se")
+seb <- h2o.getModel(model_id="StackedEnsemble_BestOfFamily_1_AutoML_1_20250308_112044")
+metaleaner <- h2o.getModel(se@model$metalearner$name)
+
+# h2o.saveModel(seb,"stacked_ensemble_best_of_family")
+gbm_id <- model_ids |> filter(grepl("^GBM",model_id))
+# xrt_ids <- model_ids[grepl("^GBM", model_ids)]
+
+grep("GBM",model_ids,value=TRUE)[1]
+xrt <- h2o.getModel(model_id = "XRT_1_AutoML_1_20250308_112044")
+DRF <- h2o.getModel(model_id = "DRF_1_AutoML_1_20250308_112044")
+GLM <- h2o.getModel(model_id = "GLM_1_AutoML_1_20250308_112044")
+DeepLearning <- h2o.getModel(model_id = "DeepLearning_1_AutoML_1_20250308_112044")
+
+gbm_model <- list()
+for(i in 1:nrow(gbm_id)){
+  print(i)
+gbm_model[[i]] <- h2o.getModel(model_id = gbm_id[i,])
+}
+
+
+
+# models_to_save <- list(
+#   "GBM" = gbm,
+#   "XRT" = xrt,
+#   "DRF" = DRF,
+#   "GLM" = GLM,
+#   "DeepLearning" = DeepLearning
+# )
+# 
+# # Boucle pour sauvegarder chaque modèle
+# for (model_name in names(models_to_save)) {
+#   model <- models_to_save[[model_name]]
+#   h2o.saveModel(model, path = paste0(model_name, "_h2o_autoML"))
+#   print(paste("Modèle", model_name, "sauvegardé."))
+# }
+
+
+```
+
+```{r}
+
+names <- se@model$cross_validation_metrics_summary |> row.names()
+Summary <- cbind(Metrics=names,se@model$cross_validation_metrics_summary ) t(Summary)
+
+Summary |> gt() |> 
+  # tab_caption(caption = "nkjdsnj") |> 
+  tab_header(title="Résumé des differentes metriques") |> 
+  tab_style(
+    style=list(
+      cell_fill(color="#FFFACD")),
+    locations=cells_body(columns = 1)
+  ) |> 
+  tab_style(
+    style=list(
+      cell_fill(color="Lightskyblue")
+    ),
+    locations = cells_body(columns = 2))
+```
+
+```{r}
+#Prediction avec le model leader
+predictions <- h2o.predict(auto@leader,test)
+# performa,ce dmodel
+perf_leader <- h2o.performance(auto@leader,test,valid = TRUE)
+```
+
+```{r}
+# 
+# tracer_courbes_roc_h2o <- function(modeles, noms_modeles, donnees_test) {
+#   # ____________________________________________________________
+#   # Trace les courbes ROC pour plusieurs modèles H2O dans un seul graphique.
+#   # 
+#   # Args:
+#   #   modeles: Une liste de modèles H2O.
+#   #   noms_modeles: Un vecteur de chaînes de caractères contenant les noms des modèles.
+#   #   donnees_test: Un H2OFrame contenant les données de test.
+#   # 
+#   # Returns:
+#   #   Un graphique ggplot2 contenant les courbes ROC pour chaque modèle.
+#   # # _________________________________________________________
+# 
+#   # Créer un dataframe pour stocker les résultats
+#   roc_data <- data.frame()
+# 
+#   # Boucle sur les modèles
+#   for (i in 1:6) {
+#     modele <- modeles[[i]]
+#     nom_modele <- noms_modeles[i]
+# 
+#     # Obtenir l'objet de performance H2O
+#     performance <- h2o.performance(modele, newdata = donnees_test)
+# 
+#     # Extraire les spécificités et les sensibilités
+#     fpr <- h2o.fpr(performance)
+#     tpr <- h2o.tpr(performance)
+# 
+#     # Ajouter les résultats au dataframe
+#     roc_data <- rbind(roc_data, data.frame(FPR = fpr, TPR = tpr, Model = nom_modele))
+#   }
+# 
+#   # Tracer les courbes ROC avec ggplot2
+#   ggplot(roc_data, aes(x = FPR, y = TPR, color = Model)) +
+#     geom_line() +
+#     geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+#     labs(
+#       title = "Courbes ROC pour différents modèles H2O",
+#       x = "Taux de faux positifs (1 - Spécificité)",
+#       y = "Taux de vrais positifs (Sensibilité)"
+#     ) +
+#     theme_minimal()
+# }
+# 
+
+
+
+```
+
+```{r}
+
+# MetricAutoMl_data <- data.frame(
+#   row.names = c("GBM","XRT","GLM","DeepLearning","DRF"),
+#   Specificity=c(),
+#   Sensitivity =c(),
+#   Score_F1=c(),
+#   
+# )
+
+model_leader <-auto@leader
+model_leader@parameters
+# h2o.saveModel(best_gbm_model,"best_model_gbm_from_auto_ml")
+best_performance_gbm <- h2o.performance(best_gbm_model,test)
+Test_Calib <- h2o.performance(best_gbm_model,calib)
+
+
+```
+
+```{r}
+matrice_conf(best_performance_gbm,"GBM","Model:Best GBM model from AutoML")
+matrice_conf(Test_Calib,"GBM,2éme test d'efficacité","Données:Calibrage") 
+```
+
+```{r}
+
+A <- h2o.learning_curve_plot(best_gbm_model,"aucpr")+
+  labs(
+  title = "Courbe d'apprentissage ",
+  subtitle = "Gradient Boosting  (Model)",
+  x="Arbres",
+  y="Auc Précision",
+  caption = "Data:Vars OverSampling"
+)
+B <- h2o.learning_curve_plot(best_gbm_model,"auc")+
+  labs(
+  title = "Courbe d'apprentissage ",
+  subtitle = "Gradient Boosting (Model)",
+  x="Arbres",
+  y="AUC",
+  caption = "Data:Vars OverSampling"
+)
+
+# plot_grid(A,B,nrow = 1,scale = 1)
+
+gridExtra::grid.arrange(A,B,nrow=2)
+```
+
+```{r}
+h2o.varimp_plot(best_gbm_model)
+
+```
+
+```{r}
+best_gbm_model@model$variable_importances |> 
+  ggplot(aes(x=reorder(variable, - scaled_importance), y=scaled_importance, fill=scaled_importance)) +
+  geom_col() +
+  scale_fill_viridis_c(option = "A") +  # Dégradé thermique (Viridis)
+  labs(x="Variable",
+       y="Features Importances",
+       title="Variables importantes",
+       fill="Importances") +
+  bbc_style()+
+  theme(legend.text = element_text(size=12),
+        legend.title = element_text(size=15,family = "serif",face="bold.italic",color = "purple"))+
+  theme_pubclean()+
+  theme(legend.title = element_text(size=15,family = "serif",face="bold.italic",color = "darkred"),
+        plot.title = element_text(color="darkred",face="bold.italic"),
+        legend.position = "right")+
+   coord_flip() 
+
+# Installer devtools si ce n'est pas déjà fait
+# install.packages("devtools")
+
+
+# # Finalisons le graphique avec le logo et les dimensions spécifiées
+# bbplot::finalise_plot(
+#   plot_name = plt,
+#   source_name = "Source: Votre Source",
+#   # save_filepath = "chemin/vers/votre_graphique.png",
+#   width_pixels = 840,
+#   height_pixels = 180
+#   # logo_image_path = "chemin/vers/logo.png"
+# )
+
+
+```
+
+Les ***V10,V12,V14 et V17** sont les variables que ce modèle estime comme étant les plus **influents*** dans le sens où ces variables sont très discriminantes pour la prédiction des transactions frauduleuses . Nous allons **analyser** en détails leurs contributions dans la **prédiction** des ***transactions frauduleuses***
+
+```{r}
+h2o.shap_explain_row_plot(
+  best_gbm_model,
+  test
+)
+```
+
+```{r}
+# permutations_plot <- h2o.permutation_importance(
+#   best_gbm_model,
+#   test,
+#   metric = "AUTO",
+#   n_repeats = 100,
+#   seed=123
+#   # n_samples = 20
+#   
+# )
+```
+
+#### Synthèse
+
+```{r}
+h2o.varimp_heatmap(auto) |> ggplotly()
+```
+
+```{r}
+library(cowplot)
+lift <- Lift(auto@leader)
+lean_curve <- h2o.learning_curve_plot(auto@leader)
+mat_conf <- matrice_conf(perf_leader,"","")
+Var_imp_leader <- h2o.varimp(auto@leader)
+# mat_conf_grob <- as_grob(mat_conf)
+# plot_grid(pr,lift,lean_curve)
+draw_pr(perf_leader,"","")
+lean_curve
+lift
+mat_conf
+# pr
+h2o.varimp_plot(auto@leader)
+```
+
+```{r}
+perf <- h2o.performance(gbm,test)
+draw_pr(perf,"","")
+matrice_conf(perf,"","")
+Lift(gbm)
+h2o.learning_curve_plot(gbm,"auc")
+```
+
+```{r}
+
+gbm_model_over <- h2o.gbm(
+  x=x,
+  y=y,
+  training_frame = Train_over,
+  validation_frame = test,
+  # nfolds = 5,
+  # ntrees = 30,
+  # seed=123,
+  max_depth =13,
+  # min_rows = 20,
+  # # fold_assignment = "Random",
+  learn_rate = 0.1
+  # # weights_column = "weight",
+  # sample_rate = 0.75,
+  # # keep_cross_validation_predictions = TRUE,
+  # col_sample_rate = 0.75,
+  # 
+  # calibrate_model = TRUE,
+  # calibration_frame = calib,
+  # calibration_method = "PlattScaling" #PlattScaling
+  
+)
+perf_gbm_over <- h2o.performance(gbm_model_over,test,valid = TRUE)
+pred_gbm_over <- h2o.predict(gbm_model_over,test)
+perf_gbm_over
+```
+
+#### Matrice de confusion
+
+```{r}
+matrice_conf(perf_gbm_over,"Gradient Boosting Model","Echantillonge:OverSampling")
+```
+
+```{r}
+#| message: false
+#| warning: false
+library(ggthemes)
+ h2o.learning_curve_plot(gbm_model_over,"aucpr")+labs(
+  title = "Courbe d'apprentissage ",
+  subtitle = "Gradient Boosting (Model)",
+  x="Arbres",
+  y="aucpr",
+  caption = "Data:Vars OverSampling")
+# )+geom_jitter(shape=21,size=0.5)+
+  # # ggthemes::theme_fivethirtyeight(base_size = 9,
+  # #                                  base_family = "serif")+
+  #  # si_style()
+  # theme(text = element_text(
+  #   colour = "grey30"
+  # ),plot.title.position = "plot",
+  # plot.caption.position = "plot"
+  # )+scale_color_manual(values=c("#E69F00", "#009E73", "#0072B2","#CC79A7"))
+```
+
+```{r}
+
+draw_pr(perf = perf_gbm_over,"Model: GBM","Echantillonage:OverSampling",x=0.8)
+```
+
+```{r}
+Lift(gbm_model_over)
+```
+
+```{r}
+
+gbm_model_both <- h2o.gbm(
+  x=x,
+  y=y,
+  training_frame = Train_both,
+  validation_frame = test,
+  nfolds = 5,
+  ntrees = 150,
+  seed=123,
+  max_depth =5,
+  min_rows = 10,
+  # fold_assignment = "Random",
+  learn_rate = 0.08 ,
+  # weights_column = "weight",
+  sample_rate = 0.85,
+  # keep_cross_validation_predictions = TRUE,
+  col_sample_rate = 0.75,
+  calibrate_model = TRUE,
+  calibration_frame = calib,
+  calibration_method = "PlattScaling" #PlattScaling
+  
+)
+perf_gbm_over <- h2o.performance(gbm_model_over,test,valid = TRUE)
+pred_gbm_over <- h2o.predict(gbm_model_over,test)
+perf_gbm_over
+```
+
+#### Arbre de decisions
+
+```{r}
+rpart_model <- h2o.decision_tree(
+  x=x,
+  y=y,
+  training_frame = train,
+  seed=123,
+  max_depth = 6
+
+)
+
+# thematic::okabe_ito(4)
+
+rpart_perf <- h2o.performance(rpart_model,test)
+rpart_perf
+```
+
+```{r}
+h2o.gains_lift_plot(rpart_perf)
+
+```
+
+#### Xgboost
+
+```{r}
+
+
+```
+
+```{r}
+
+glm_model <- h2o.glm(
+  x = x,
+  y = y,
+  training_frame = train,
+  validation_frame = test,
+  family = "binomial",
+  lambda_search = TRUE  # Recherche de régularisation (LASSO/Ridge)
+)
+
+```
+
+```{r}
+# Les deux commandes suivantes suppriment tous les packages H2O précédemment 
+
+h2o.xgboost.available()
+
+```
